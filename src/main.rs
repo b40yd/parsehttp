@@ -8,7 +8,6 @@ use pnet::packet::Packet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-/// 流量分析工具 - 支持实时抓包与文件解析
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -27,7 +26,6 @@ enum Commands {
     Live {
         #[arg(short, long)]
         interface: String,
-        /// BPF 过滤器 (例如: "tcp port 4081")
         #[arg(short, long, default_value = "tcp")]
         filter: String,
     },
@@ -95,35 +93,33 @@ fn main() {
             }
         }
         Commands::File { path } => {
-            println!("\x1b[1;36m🚀 正在分析文件: {}\x1b[0m\n", path);
             let cap = Capture::from_file(path).expect("无法打开文件");
-            run_analysis(cap, &mut streams);
-            // 处理结束后刷新所有残余事务
+            run_analysis(cap, &mut streams, false);
             for (_, s) in streams {
-                flush_tx(&s.current_tx);
+                flush_final(&s.current_tx);
             }
         }
         Commands::Live { interface, filter } => {
             let device = Device::list()
-                .expect("无法获取设备")
+                .expect("获取设备失败")
                 .into_iter()
                 .find(|d| d.name == interface)
-                .expect("找不到指定的网卡");
+                .expect("找不到网卡");
 
             let mut cap = Capture::from_device(device)
-                .expect("无法打开网卡")
+                .expect("打开网卡失败")
                 .promisc(true)
                 .snaplen(65535)
                 .immediate_mode(true)
                 .open()
                 .expect("开启抓包失败");
 
-            cap.filter(&filter, true).expect("过滤器语法错误");
+            cap.filter(&filter, true).expect("BPF语法错误");
             println!(
-                "\x1b[1;33m正在网卡 {} 上实时抓包 (过滤: {})...\x1b[0m",
+                "\x1b[1;33m实时监听: {} (Filter: {})\x1b[0m",
                 interface, filter
             );
-            run_analysis(cap, &mut streams);
+            run_analysis(cap, &mut streams, true);
         }
     }
 }
@@ -131,6 +127,7 @@ fn main() {
 fn run_analysis<T: pcap::Activated>(
     mut cap: Capture<T>,
     streams: &mut HashMap<FlowKey, StreamBuffer>,
+    live: bool,
 ) {
     while let Ok(packet) = cap.next_packet() {
         if let Some(eth) = EthernetPacket::new(packet.data) {
@@ -164,16 +161,15 @@ fn run_analysis<T: pcap::Activated>(
                         data: Vec::new(),
                         current_tx: None,
                     });
-
                     stream.data.extend_from_slice(tcp_payload);
-                    process_stream(stream);
+                    process_stream(stream, live);
                 }
             }
         }
     }
 }
 
-fn process_stream(stream: &mut StreamBuffer) {
+fn process_stream(stream: &mut StreamBuffer, live: bool) {
     loop {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut consumed = 0;
@@ -249,32 +245,42 @@ fn process_stream(stream: &mut StreamBuffer) {
                         tx.expected_res_len = content_len;
                         tx.state = TransactionState::ResponseBody;
                         consumed = amt;
+                        if live {
+                            render_live_session(tx);
+                        }
                     }
                 }
                 TransactionState::ResponseBody => {
                     if tx.is_sse {
                         let body_part = String::from_utf8_lossy(&stream.data).to_string();
+                        let mut new_event = false;
                         for event in body_part.split("\n\n") {
                             if !event.trim().is_empty() {
                                 tx.res_body_events.push(event.trim().to_string());
+                                new_event = true;
                             }
                         }
                         consumed = stream.data.len();
-                        // SSE 通常直到新请求到来前不清理 tx
+                        if live && new_event {
+                            render_live_session(tx);
+                        }
                     } else {
                         let remaining = tx.expected_res_len - tx.res_body_raw.len();
                         let take = std::cmp::min(remaining, stream.data.len());
                         tx.res_body_raw.extend_from_slice(&stream.data[..take]);
                         consumed = take;
                         if tx.res_body_raw.len() >= tx.expected_res_len {
-                            flush_tx(&stream.current_tx);
+                            if live {
+                                render_live_session(tx);
+                            } else {
+                                flush_final(&stream.current_tx);
+                            }
                             stream.current_tx = None;
                         }
                     }
                 }
             }
         }
-
         if consumed > 0 {
             stream.data.drain(..consumed);
         } else {
@@ -283,34 +289,56 @@ fn process_stream(stream: &mut StreamBuffer) {
     }
 }
 
-fn flush_tx(tx_opt: &Option<HttpTransaction>) {
+fn render_live_session(tx: &HttpTransaction) {
+    println!("\n\x1b[1;35m--- [Session Update] ---\x1b[0m");
+    println!("{}", tx.req_header);
+    if !tx.req_body.is_empty() {
+        println!("  \x1b[90m[Request Body]\x1b[0m");
+        pretty_print_json(&String::from_utf8_lossy(&tx.req_body), "    ");
+    }
+    if !tx.res_header.is_empty() {
+        println!("\n{}", tx.res_header);
+        if tx.is_sse {
+            println!(
+                "  \x1b[90m(SSE Stream: {} events)\x1b[0m",
+                tx.res_body_events.len()
+            );
+            let start = tx.res_body_events.len().saturating_sub(5); // 仅显示最近5条防刷屏
+            for event in &tx.res_body_events[start..] {
+                if event.starts_with(": ping") {
+                    println!("    \x1b[90m{}\x1b[0m", event);
+                } else {
+                    println!("    \x1b[33m[Event]\x1b[0m");
+                    pretty_print_json(event, "      ");
+                }
+            }
+        } else if !tx.res_body_raw.is_empty() {
+            println!("  \x1b[90m[Response Body]\x1b[0m");
+            pretty_print_json(&String::from_utf8_lossy(&tx.res_body_raw), "    ");
+        }
+    }
+    println!("\x1b[1;35m------------------------\x1b[0m");
+}
+
+fn flush_final(tx_opt: &Option<HttpTransaction>) {
     if let Some(tx) = tx_opt {
         if tx.req_header.is_empty() {
             return;
         }
         println!("{}", tx.req_header);
         if !tx.req_body.is_empty() {
-            println!("  \x1b[90m[Request Body]\x1b[0m");
             pretty_print_json(&String::from_utf8_lossy(&tx.req_body), "    ");
         }
         if !tx.res_header.is_empty() {
             println!("\n{}", tx.res_header);
-            if tx.is_sse {
-                println!("  \x1b[90m(SSE Stream Events)\x1b[0m");
-                for event in &tx.res_body_events {
-                    if event.starts_with(": ping") {
-                        println!("    \x1b[90m{}\x1b[0m", event);
-                    } else {
-                        println!("    \x1b[33m[Event]\x1b[0m");
-                        pretty_print_json(event, "      ");
-                    }
-                }
-            } else if !tx.res_body_raw.is_empty() {
-                println!("  \x1b[90m[Response Body]\x1b[0m");
+            for event in &tx.res_body_events {
+                pretty_print_json(event, "    ");
+            }
+            if !tx.res_body_raw.is_empty() {
                 pretty_print_json(&String::from_utf8_lossy(&tx.res_body_raw), "    ");
             }
         }
-        println!("{}\n", "=".repeat(70));
+        println!("{}\n", "=".repeat(60));
     }
 }
 
