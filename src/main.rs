@@ -8,7 +8,7 @@ use pnet::packet::Packet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-/// MCP 流量分析工具 - 支持实时抓包与文件解析
+/// 流量分析工具 - 支持实时抓包与文件解析
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
