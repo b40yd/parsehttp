@@ -1,0 +1,10 @@
+[package]
+name = "httpparse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+httparse = "1.10.1"
+pcap = "2.4.0"
+pnet = "0.35.0"
+serde_json = "1.0.146"
