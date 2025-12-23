@@ -1,4 +1,5 @@
-use pcap::Capture;
+use clap::{Parser, Subcommand};
+use pcap::{Capture, Device};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
@@ -6,7 +7,33 @@ use pnet::packet::tcp::TcpPacket;
 use pnet::packet::Packet;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::{env, str};
+
+/// MCP 流量分析工具 - 支持实时抓包与文件解析
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// 从指定的 pcap 文件解析流量
+    File {
+        #[arg(short, long)]
+        path: String,
+    },
+    /// 从网络接口实时抓取流量 (需 root/admin 权限)
+    Live {
+        #[arg(short, long)]
+        interface: String,
+        /// BPF 过滤器 (例如: "tcp port 4081")
+        #[arg(short, long, default_value = "tcp")]
+        filter: String,
+    },
+    /// 列出所有可用的网络接口
+    List,
+}
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 struct FlowKey {
@@ -57,17 +84,54 @@ struct StreamBuffer {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("用法: {} <pcap文件>", args[0]);
-        return;
-    }
-
-    let mut cap = Capture::from_file(&args[1]).expect("无法打开 pcap 文件");
+    let cli = Cli::parse();
     let mut streams: HashMap<FlowKey, StreamBuffer> = HashMap::new();
 
-    println!("\x1b[1;36m🚀 MCP 事务分析 - [逻辑状态机隔离模式]\x1b[0m\n");
+    match cli.command {
+        Commands::List => {
+            println!("\x1b[1m可用网卡列表:\x1b[0m");
+            for device in Device::list().expect("无法获取设备列表") {
+                println!(" - {}", device.name);
+            }
+        }
+        Commands::File { path } => {
+            println!("\x1b[1;36m🚀 正在分析文件: {}\x1b[0m\n", path);
+            let cap = Capture::from_file(path).expect("无法打开文件");
+            run_analysis(cap, &mut streams);
+            // 处理结束后刷新所有残余事务
+            for (_, s) in streams {
+                flush_tx(&s.current_tx);
+            }
+        }
+        Commands::Live { interface, filter } => {
+            let device = Device::list()
+                .expect("无法获取设备")
+                .into_iter()
+                .find(|d| d.name == interface)
+                .expect("找不到指定的网卡");
 
+            let mut cap = Capture::from_device(device)
+                .expect("无法打开网卡")
+                .promisc(true)
+                .snaplen(65535)
+                .immediate_mode(true)
+                .open()
+                .expect("开启抓包失败");
+
+            cap.filter(&filter, true).expect("过滤器语法错误");
+            println!(
+                "\x1b[1;33m正在网卡 {} 上实时抓包 (过滤: {})...\x1b[0m",
+                interface, filter
+            );
+            run_analysis(cap, &mut streams);
+        }
+    }
+}
+
+fn run_analysis<T: pcap::Activated>(
+    mut cap: Capture<T>,
+    streams: &mut HashMap<FlowKey, StreamBuffer>,
+) {
     while let Ok(packet) = cap.next_packet() {
         if let Some(eth) = EthernetPacket::new(packet.data) {
             let info = match eth.get_ethertype() {
@@ -107,9 +171,6 @@ fn main() {
             }
         }
     }
-    for (_, s) in streams {
-        flush_tx(&s.current_tx);
-    }
 }
 
 fn process_stream(stream: &mut StreamBuffer) {
@@ -118,43 +179,39 @@ fn process_stream(stream: &mut StreamBuffer) {
         let mut consumed = 0;
 
         if stream.current_tx.is_none() {
-            // 尝试解析 Request Header
             let mut req = httparse::Request::new(&mut headers);
-            match req.parse(&stream.data) {
-                Ok(httparse::Status::Complete(amt)) => {
-                    let mut content_len = 0;
-                    let mut h_details = String::new();
-                    for h in req.headers.iter() {
-                        let name = h.name.to_lowercase();
-                        let val = String::from_utf8_lossy(h.value);
-                        if name == "content-length" {
-                            content_len = val.parse::<usize>().unwrap_or(0);
-                        }
-                        h_details.push_str(&format!("  {}: {}\n", h.name, val));
+            if let Ok(httparse::Status::Complete(amt)) = req.parse(&stream.data) {
+                let mut content_len = 0;
+                let mut h_details = String::new();
+                for h in req.headers.iter() {
+                    let name = h.name.to_lowercase();
+                    let val = String::from_utf8_lossy(h.value);
+                    if name == "content-length" {
+                        content_len = val.parse::<usize>().unwrap_or(0);
                     }
-                    stream.current_tx = Some(HttpTransaction {
-                        req_header: format!(
-                            "\x1b[1;32m▶ REQUEST: {} {}\x1b[0m\n{}",
-                            req.method.unwrap_or(""),
-                            req.path.unwrap_or(""),
-                            h_details
-                        ),
-                        req_body: Vec::new(),
-                        expected_req_len: content_len,
-                        res_header: String::new(),
-                        res_body_raw: Vec::new(),
-                        res_body_events: Vec::new(),
-                        expected_res_len: 0,
-                        is_sse: false,
-                        state: if content_len > 0 {
-                            TransactionState::RequestBody
-                        } else {
-                            TransactionState::ResponseHeader
-                        },
-                    });
-                    consumed = amt;
+                    h_details.push_str(&format!("  {}: {}\n", h.name, val));
                 }
-                _ => break, // 数据不足或不是请求，跳出循环
+                stream.current_tx = Some(HttpTransaction {
+                    req_header: format!(
+                        "\x1b[1;32m▶ REQUEST: {} {}\x1b[0m\n{}",
+                        req.method.unwrap_or(""),
+                        req.path.unwrap_or(""),
+                        h_details
+                    ),
+                    req_body: Vec::new(),
+                    expected_req_len: content_len,
+                    res_header: String::new(),
+                    res_body_raw: Vec::new(),
+                    res_body_events: Vec::new(),
+                    expected_res_len: 0,
+                    is_sse: false,
+                    state: if content_len > 0 {
+                        TransactionState::RequestBody
+                    } else {
+                        TransactionState::ResponseHeader
+                    },
+                });
+                consumed = amt;
             }
         } else if let Some(tx) = &mut stream.current_tx {
             match tx.state {
@@ -169,45 +226,41 @@ fn process_stream(stream: &mut StreamBuffer) {
                 }
                 TransactionState::ResponseHeader => {
                     let mut res = httparse::Response::new(&mut headers);
-                    match res.parse(&stream.data) {
-                        Ok(httparse::Status::Complete(amt)) => {
-                            let mut content_len = 0;
-                            let mut h_details = String::new();
-                            for h in res.headers.iter() {
-                                let name = h.name.to_lowercase();
-                                let val = String::from_utf8_lossy(h.value);
-                                if name == "content-type" && val.contains("text/event-stream") {
-                                    tx.is_sse = true;
-                                }
-                                if name == "content-length" {
-                                    content_len = val.parse::<usize>().unwrap_or(0);
-                                }
-                                h_details.push_str(&format!("  {}: {}\n", h.name, val));
+                    if let Ok(httparse::Status::Complete(amt)) = res.parse(&stream.data) {
+                        let mut content_len = 0;
+                        let mut h_details = String::new();
+                        for h in res.headers.iter() {
+                            let name = h.name.to_lowercase();
+                            let val = String::from_utf8_lossy(h.value);
+                            if name == "content-type" && val.contains("text/event-stream") {
+                                tx.is_sse = true;
                             }
-                            tx.res_header = format!(
-                                "\x1b[1;34m◀ RESPONSE: {} {}\x1b[0m\n{}",
-                                res.code.unwrap_or(0),
-                                res.reason.unwrap_or(""),
-                                h_details
-                            );
-                            tx.expected_res_len = content_len;
-                            tx.state = TransactionState::ResponseBody;
-                            consumed = amt;
+                            if name == "content-length" {
+                                content_len = val.parse::<usize>().unwrap_or(0);
+                            }
+                            h_details.push_str(&format!("  {}: {}\n", h.name, val));
                         }
-                        _ => break,
+                        tx.res_header = format!(
+                            "\x1b[1;34m◀ RESPONSE: {} {}\x1b[0m\n{}",
+                            res.code.unwrap_or(0),
+                            res.reason.unwrap_or(""),
+                            h_details
+                        );
+                        tx.expected_res_len = content_len;
+                        tx.state = TransactionState::ResponseBody;
+                        consumed = amt;
                     }
                 }
                 TransactionState::ResponseBody => {
                     if tx.is_sse {
                         let body_part = String::from_utf8_lossy(&stream.data).to_string();
-                        // SSE 需要保存原始字符串进行按行切分
                         for event in body_part.split("\n\n") {
                             if !event.trim().is_empty() {
                                 tx.res_body_events.push(event.trim().to_string());
                             }
                         }
                         consumed = stream.data.len();
-                        // SSE 通常不自动关闭事务，等待下一个请求触发 Flush
+                        // SSE 通常直到新请求到来前不清理 tx
                     } else {
                         let remaining = tx.expected_res_len - tx.res_body_raw.len();
                         let take = std::cmp::min(remaining, stream.data.len());
@@ -235,18 +288,13 @@ fn flush_tx(tx_opt: &Option<HttpTransaction>) {
         if tx.req_header.is_empty() {
             return;
         }
-
-        // --- 1. 打印 Request 块 ---
         println!("{}", tx.req_header);
         if !tx.req_body.is_empty() {
             println!("  \x1b[90m[Request Body]\x1b[0m");
             pretty_print_json(&String::from_utf8_lossy(&tx.req_body), "    ");
         }
-        println!("");
-
-        // --- 2. 打印 Response 块 ---
         if !tx.res_header.is_empty() {
-            println!("{}", tx.res_header);
+            println!("\n{}", tx.res_header);
             if tx.is_sse {
                 println!("  \x1b[90m(SSE Stream Events)\x1b[0m");
                 for event in &tx.res_body_events {
@@ -267,13 +315,11 @@ fn flush_tx(tx_opt: &Option<HttpTransaction>) {
 }
 
 fn pretty_print_json(raw: &str, indent: &str) {
-    // 自动剥离 SSE 的 data: 前缀
     let clean = if raw.starts_with("data: ") {
         raw.strip_prefix("data: ").unwrap_or(raw).trim()
     } else {
         raw.trim()
     };
-
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean) {
         if let Ok(pretty) = serde_json::to_string_pretty(&json) {
             for line in pretty.lines() {
@@ -282,6 +328,5 @@ fn pretty_print_json(raw: &str, indent: &str) {
             return;
         }
     }
-    // 如果不是 JSON，直接缩进打印原文本
     println!("{}{}", indent, raw);
 }

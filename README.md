@@ -59,8 +59,15 @@ MCP 交互中包含大量的嵌入式 JSON 字符串。
 将您的 `.pcap` 文件放在程序目录下，执行以下命令：
 
 ```bash
-cargo run -- <你的文件名>.pcap
+cargo run -- file -p <你的文件名>.pcap
 
+```
+
+从网口解析http网络请求。同时支持BPF过滤。
+
+``` bash
+cargo run -- live -i eth0
+cargo run -- live -i eth0 -f "tcp port 8080"
 ```
 
 ---
