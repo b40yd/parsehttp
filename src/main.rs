@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -17,19 +17,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 从指定的 pcap 文件解析流量
+    /// 从 pcap 文件解析
     File {
         #[arg(short, long)]
         path: String,
     },
-    /// 从网络接口实时抓取流量 (需 root/admin 权限)
+    /// 实时抓包
     Live {
         #[arg(short, long)]
         interface: String,
         #[arg(short, long, default_value = "tcp")]
         filter: String,
     },
-    /// 列出所有可用的网络接口
+    /// 列出网卡
     List,
 }
 
@@ -74,6 +74,7 @@ struct HttpTransaction {
     expected_res_len: usize,
     is_sse: bool,
     state: TransactionState,
+    req_printed: bool, // 用于普通请求防止重复打印
 }
 
 struct StreamBuffer {
@@ -88,38 +89,33 @@ fn main() {
     match cli.command {
         Commands::List => {
             println!("\x1b[1m可用网卡列表:\x1b[0m");
-            for device in Device::list().expect("无法获取设备列表") {
-                println!(" - {}", device.name);
+            for d in Device::list().unwrap() {
+                println!(" - {}", d.name);
             }
         }
         Commands::File { path } => {
             let cap = Capture::from_file(path).expect("无法打开文件");
-            run_analysis(cap, &mut streams, false);
-            for (_, s) in streams {
-                flush_final(&s.current_tx);
-            }
+            run_analysis(cap, &mut streams);
         }
         Commands::Live { interface, filter } => {
             let device = Device::list()
-                .expect("获取设备失败")
+                .unwrap()
                 .into_iter()
                 .find(|d| d.name == interface)
                 .expect("找不到网卡");
-
             let mut cap = Capture::from_device(device)
-                .expect("打开网卡失败")
+                .unwrap()
                 .promisc(true)
                 .snaplen(65535)
                 .immediate_mode(true)
                 .open()
-                .expect("开启抓包失败");
-
-            cap.filter(&filter, true).expect("BPF语法错误");
+                .unwrap();
+            cap.filter(&filter, true).unwrap();
             println!(
-                "\x1b[1;33m实时监听: {} (Filter: {})\x1b[0m",
+                "\x1b[1;33m正在监听接口: {} (过滤器: {})\x1b[0m",
                 interface, filter
             );
-            run_analysis(cap, &mut streams, true);
+            run_analysis(cap, &mut streams);
         }
     }
 }
@@ -127,7 +123,6 @@ fn main() {
 fn run_analysis<T: pcap::Activated>(
     mut cap: Capture<T>,
     streams: &mut HashMap<FlowKey, StreamBuffer>,
-    live: bool,
 ) {
     while let Ok(packet) = cap.next_packet() {
         if let Some(eth) = EthernetPacket::new(packet.data) {
@@ -148,28 +143,25 @@ fn run_analysis<T: pcap::Activated>(
                 }),
                 _ => None,
             };
-
-            if let Some((src, dst, ip_payload)) = info {
-                if let Some(tcp) = TcpPacket::new(&ip_payload) {
-                    let tcp_payload = tcp.payload();
-                    if tcp_payload.is_empty() {
+            if let Some((src, dst, ip_p)) = info {
+                if let Some(tcp) = TcpPacket::new(&ip_p) {
+                    if tcp.payload().is_empty() {
                         continue;
                     }
-
                     let key = FlowKey::new(src, tcp.get_source(), dst, tcp.get_destination());
                     let stream = streams.entry(key).or_insert(StreamBuffer {
                         data: Vec::new(),
                         current_tx: None,
                     });
-                    stream.data.extend_from_slice(tcp_payload);
-                    process_stream(stream, live);
+                    stream.data.extend_from_slice(tcp.payload());
+                    process_stream(stream);
                 }
             }
         }
     }
 }
 
-fn process_stream(stream: &mut StreamBuffer, live: bool) {
+fn process_stream(stream: &mut StreamBuffer) {
     loop {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut consumed = 0;
@@ -178,21 +170,24 @@ fn process_stream(stream: &mut StreamBuffer, live: bool) {
             let mut req = httparse::Request::new(&mut headers);
             if let Ok(httparse::Status::Complete(amt)) = req.parse(&stream.data) {
                 let mut content_len = 0;
-                let mut h_details = String::new();
+                let mut h_str = String::new();
                 for h in req.headers.iter() {
                     let name = h.name.to_lowercase();
-                    let val = String::from_utf8_lossy(h.value);
                     if name == "content-length" {
-                        content_len = val.parse::<usize>().unwrap_or(0);
+                        content_len = String::from_utf8_lossy(h.value).parse().unwrap_or(0);
                     }
-                    h_details.push_str(&format!("  {}: {}\n", h.name, val));
+                    h_str.push_str(&format!(
+                        "  {}: {}\n",
+                        h.name,
+                        String::from_utf8_lossy(h.value)
+                    ));
                 }
                 stream.current_tx = Some(HttpTransaction {
                     req_header: format!(
                         "\x1b[1;32m▶ REQUEST: {} {}\x1b[0m\n{}",
                         req.method.unwrap_or(""),
                         req.path.unwrap_or(""),
-                        h_details
+                        h_str
                     ),
                     req_body: Vec::new(),
                     expected_req_len: content_len,
@@ -201,6 +196,7 @@ fn process_stream(stream: &mut StreamBuffer, live: bool) {
                     res_body_events: Vec::new(),
                     expected_res_len: 0,
                     is_sse: false,
+                    req_printed: false,
                     state: if content_len > 0 {
                         TransactionState::RequestBody
                     } else {
@@ -212,8 +208,8 @@ fn process_stream(stream: &mut StreamBuffer, live: bool) {
         } else if let Some(tx) = &mut stream.current_tx {
             match tx.state {
                 TransactionState::RequestBody => {
-                    let remaining = tx.expected_req_len - tx.req_body.len();
-                    let take = std::cmp::min(remaining, stream.data.len());
+                    let take =
+                        std::cmp::min(tx.expected_req_len - tx.req_body.len(), stream.data.len());
                     tx.req_body.extend_from_slice(&stream.data[..take]);
                     consumed = take;
                     if tx.req_body.len() >= tx.expected_req_len {
@@ -223,8 +219,8 @@ fn process_stream(stream: &mut StreamBuffer, live: bool) {
                 TransactionState::ResponseHeader => {
                     let mut res = httparse::Response::new(&mut headers);
                     if let Ok(httparse::Status::Complete(amt)) = res.parse(&stream.data) {
-                        let mut content_len = 0;
-                        let mut h_details = String::new();
+                        let mut clen = 0;
+                        let mut h_str = String::new();
                         for h in res.headers.iter() {
                             let name = h.name.to_lowercase();
                             let val = String::from_utf8_lossy(h.value);
@@ -232,49 +228,54 @@ fn process_stream(stream: &mut StreamBuffer, live: bool) {
                                 tx.is_sse = true;
                             }
                             if name == "content-length" {
-                                content_len = val.parse::<usize>().unwrap_or(0);
+                                clen = val.parse().unwrap_or(0);
                             }
-                            h_details.push_str(&format!("  {}: {}\n", h.name, val));
+                            h_str.push_str(&format!("  {}: {}\n", h.name, val));
                         }
                         tx.res_header = format!(
                             "\x1b[1;34m◀ RESPONSE: {} {}\x1b[0m\n{}",
                             res.code.unwrap_or(0),
                             res.reason.unwrap_or(""),
-                            h_details
+                            h_str
                         );
-                        tx.expected_res_len = content_len;
+                        tx.expected_res_len = clen;
                         tx.state = TransactionState::ResponseBody;
                         consumed = amt;
-                        if live {
-                            render_live_session(tx);
+
+                        // 如果响应没有 Body (CL=0) 且非 SSE，立即输出
+                        if !tx.is_sse && tx.expected_res_len == 0 {
+                            output_transaction(tx);
+                            stream.current_tx = None;
                         }
                     }
                 }
                 TransactionState::ResponseBody => {
                     if tx.is_sse {
-                        let body_part = String::from_utf8_lossy(&stream.data).to_string();
-                        let mut new_event = false;
-                        for event in body_part.split("\n\n") {
-                            if !event.trim().is_empty() {
-                                tx.res_body_events.push(event.trim().to_string());
-                                new_event = true;
+                        let body = String::from_utf8_lossy(&stream.data).to_string();
+                        let mut new_e = false;
+                        // 分隔符解析
+                        for e in body.split("\n\n") {
+                            if !e.trim().is_empty() {
+                                tx.res_body_events.push(e.trim().to_string());
+                                new_e = true;
                             }
                         }
                         consumed = stream.data.len();
-                        if live && new_event {
-                            render_live_session(tx);
+                        if new_e {
+                            output_transaction(tx);
                         }
                     } else {
-                        let remaining = tx.expected_res_len - tx.res_body_raw.len();
-                        let take = std::cmp::min(remaining, stream.data.len());
+                        // 普通请求 Body 收集
+                        let take = std::cmp::min(
+                            tx.expected_res_len - tx.res_body_raw.len(),
+                            stream.data.len(),
+                        );
                         tx.res_body_raw.extend_from_slice(&stream.data[..take]);
                         consumed = take;
+
+                        // 收集完成后输出
                         if tx.res_body_raw.len() >= tx.expected_res_len {
-                            if live {
-                                render_live_session(tx);
-                            } else {
-                                flush_final(&stream.current_tx);
-                            }
+                            output_transaction(tx);
                             stream.current_tx = None;
                         }
                     }
@@ -289,72 +290,62 @@ fn process_stream(stream: &mut StreamBuffer, live: bool) {
     }
 }
 
-fn render_live_session(tx: &HttpTransaction) {
-    println!("\n\x1b[1;35m--- [Session Update] ---\x1b[0m");
-    println!("{}", tx.req_header);
-    if !tx.req_body.is_empty() {
-        println!("  \x1b[90m[Request Body]\x1b[0m");
-        pretty_print_json(&String::from_utf8_lossy(&tx.req_body), "    ");
-    }
-    if !tx.res_header.is_empty() {
-        println!("\n{}", tx.res_header);
-        if tx.is_sse {
-            println!(
-                "  \x1b[90m(SSE Stream: {} events)\x1b[0m",
-                tx.res_body_events.len()
-            );
-            let start = tx.res_body_events.len().saturating_sub(5); // 仅显示最近5条防刷屏
-            for event in &tx.res_body_events[start..] {
-                if event.starts_with(": ping") {
-                    println!("    \x1b[90m{}\x1b[0m", event);
-                } else {
-                    println!("    \x1b[33m[Event]\x1b[0m");
-                    pretty_print_json(event, "      ");
-                }
-            }
-        } else if !tx.res_body_raw.is_empty() {
-            println!("  \x1b[90m[Response Body]\x1b[0m");
-            pretty_print_json(&String::from_utf8_lossy(&tx.res_body_raw), "    ");
-        }
-    }
-    println!("\x1b[1;35m------------------------\x1b[0m");
-}
-
-fn flush_final(tx_opt: &Option<HttpTransaction>) {
-    if let Some(tx) = tx_opt {
-        if tx.req_header.is_empty() {
-            return;
-        }
+fn output_transaction(tx: &mut HttpTransaction) {
+    if tx.is_sse {
+        // SSE 模式：聚合重绘输出
+        println!(
+            "\n\x1b[1;35m[SSE 会话更新 - 累计事件: {}]\x1b[0m",
+            tx.res_body_events.len()
+        );
         println!("{}", tx.req_header);
         if !tx.req_body.is_empty() {
-            pretty_print_json(&String::from_utf8_lossy(&tx.req_body), "    ");
+            println!("  \x1b[90m[Request Body]\x1b[0m");
+            pretty_json(&String::from_utf8_lossy(&tx.req_body), "    ");
         }
-        if !tx.res_header.is_empty() {
-            println!("\n{}", tx.res_header);
-            for event in &tx.res_body_events {
-                pretty_print_json(event, "    ");
-            }
-            if !tx.res_body_raw.is_empty() {
-                pretty_print_json(&String::from_utf8_lossy(&tx.res_body_raw), "    ");
+        println!("\n{}", tx.res_header);
+        for (i, event) in tx.res_body_events.iter().enumerate() {
+            if event.starts_with(": ping") {
+                println!("    \x1b[90m[{}] {}\x1b[0m", i + 1, event);
+            } else {
+                println!("    \x1b[33m[Event {}]\x1b[0m", i + 1);
+                pretty_json(event, "      ");
             }
         }
-        println!("{}\n", "=".repeat(60));
+        println!("\x1b[1;35m{}\x1b[0m", "-".repeat(50));
+    } else if !tx.req_printed {
+        // 普通请求：收集完 Body 后一次性输出
+        println!("\n\x1b[1;36m==================== TRANSACTION ====================\x1b[0m");
+        println!("{}", tx.req_header);
+        if !tx.req_body.is_empty() {
+            println!("  \x1b[90m[Request Body]\x1b[0m");
+            pretty_json(&String::from_utf8_lossy(&tx.req_body), "    ");
+        }
+        println!("\n{}", tx.res_header);
+        if !tx.res_body_raw.is_empty() {
+            println!("  \x1b[90m[Response Body]\x1b[0m");
+            pretty_json(&String::from_utf8_lossy(&tx.res_body_raw), "    ");
+        }
+        println!("\x1b[1;36m=====================================================\x1b[0m\n");
+        tx.req_printed = true;
     }
 }
 
-fn pretty_print_json(raw: &str, indent: &str) {
+fn pretty_json(raw: &str, indent: &str) {
+    // 兼容 SSE 的 data: 前缀
     let clean = if raw.starts_with("data: ") {
         raw.strip_prefix("data: ").unwrap_or(raw).trim()
     } else {
         raw.trim()
     };
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean) {
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            for line in pretty.lines() {
-                println!("{}{}", indent, line);
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(clean) {
+        if let Ok(p) = serde_json::to_string_pretty(&v) {
+            for l in p.lines() {
+                println!("{}{}", indent, l);
             }
             return;
         }
     }
+    // 非 JSON 则原样输出
     println!("{}{}", indent, raw);
 }
