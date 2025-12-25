@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use pcap::{Capture, Device};
+use pcap::{Capture, Device, Linktype};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
@@ -22,7 +22,7 @@ enum Commands {
         #[arg(short, long)]
         path: String,
     },
-    /// 实时抓包
+    /// 实时抓包 (macOS lo0 请使用 sudo)
     Live {
         #[arg(short, long)]
         interface: String,
@@ -74,7 +74,7 @@ struct HttpTransaction {
     expected_res_len: usize,
     is_sse: bool,
     state: TransactionState,
-    req_printed: bool, // 用于普通请求防止重复打印
+    req_printed: bool,
 }
 
 struct StreamBuffer {
@@ -110,11 +110,10 @@ fn main() {
                 .immediate_mode(true)
                 .open()
                 .unwrap();
+
+            // 提示：在 lo0 上抓包，filter 建议直接用 "port 4081"
             cap.filter(&filter, true).unwrap();
-            println!(
-                "\x1b[1;33m正在监听接口: {} (过滤器: {})\x1b[0m",
-                interface, filter
-            );
+            println!("\x1b[1;33m正在监听: {} (BPF: {})\x1b[0m", interface, filter);
             run_analysis(cap, &mut streams);
         }
     }
@@ -124,40 +123,99 @@ fn run_analysis<T: pcap::Activated>(
     mut cap: Capture<T>,
     streams: &mut HashMap<FlowKey, StreamBuffer>,
 ) {
+    let link_type = cap.get_datalink();
+
     while let Ok(packet) = cap.next_packet() {
-        if let Some(eth) = EthernetPacket::new(packet.data) {
-            let info = match eth.get_ethertype() {
-                EtherTypes::Ipv4 => Ipv4Packet::new(eth.payload()).map(|ip| {
-                    (
-                        ip.get_source().into(),
-                        ip.get_destination().into(),
-                        ip.payload().to_vec(),
-                    )
-                }),
-                EtherTypes::Ipv6 => Ipv6Packet::new(eth.payload()).map(|ip| {
-                    (
-                        ip.get_source().into(),
-                        ip.get_destination().into(),
-                        ip.payload().to_vec(),
-                    )
-                }),
-                _ => None,
-            };
-            if let Some((src, dst, ip_p)) = info {
-                if let Some(tcp) = TcpPacket::new(&ip_p) {
-                    if tcp.payload().is_empty() {
-                        continue;
-                    }
-                    let key = FlowKey::new(src, tcp.get_source(), dst, tcp.get_destination());
-                    let stream = streams.entry(key).or_insert(StreamBuffer {
-                        data: Vec::new(),
-                        current_tx: None,
-                    });
-                    stream.data.extend_from_slice(tcp.payload());
-                    process_stream(stream);
+        let parsed = if link_type == Linktype::ETHERNET {
+            parse_ethernet(&packet)
+        } else if link_type == Linktype::NULL {
+            parse_null_loopback(&packet)
+        } else {
+            None
+        };
+
+        if let Some((src, dst, ip_payload)) = parsed {
+            if let Some(tcp) = TcpPacket::new(&ip_payload) {
+                if tcp.payload().is_empty() {
+                    continue;
                 }
+                let key = FlowKey::new(src, tcp.get_source(), dst, tcp.get_destination());
+                let stream = streams.entry(key).or_insert(StreamBuffer {
+                    data: Vec::new(),
+                    current_tx: None,
+                });
+                stream.data.extend_from_slice(tcp.payload());
+                process_stream(stream);
             }
         }
+    }
+}
+
+fn parse_ethernet(packet: &pcap::Packet) -> Option<(IpAddr, IpAddr, Vec<u8>)> {
+    let eth = EthernetPacket::new(packet.data)?;
+    match eth.get_ethertype() {
+        EtherTypes::Ipv4 => {
+            let ip = Ipv4Packet::new(eth.payload())?;
+            Some((
+                ip.get_source().into(),
+                ip.get_destination().into(),
+                ip.payload().to_vec(),
+            ))
+        }
+        EtherTypes::Ipv6 => {
+            let ip = Ipv6Packet::new(eth.payload())?;
+            Some((
+                ip.get_source().into(),
+                ip.get_destination().into(),
+                ip.payload().to_vec(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn parse_null_loopback(packet: &pcap::Packet) -> Option<(IpAddr, IpAddr, Vec<u8>)> {
+    if packet.data.len() < 4 {
+        return None;
+    }
+    // BSD Null Loopback 头部：4字节协议族标识
+    let family = if packet.data[0] != 0 || packet.data[1] != 0 {
+        u32::from_ne_bytes([
+            packet.data[0],
+            packet.data[1],
+            packet.data[2],
+            packet.data[3],
+        ])
+    } else {
+        u32::from_be_bytes([
+            packet.data[0],
+            packet.data[1],
+            packet.data[2],
+            packet.data[3],
+        ])
+    };
+
+    let payload = &packet.data[4..];
+    match family {
+        2 => {
+            // IPv4
+            let ip = Ipv4Packet::new(payload)?;
+            Some((
+                ip.get_source().into(),
+                ip.get_destination().into(),
+                ip.payload().to_vec(),
+            ))
+        }
+        24 | 28 | 30 => {
+            // IPv6 (不同系统的标识可能略有不同)
+            let ip = Ipv6Packet::new(payload)?;
+            Some((
+                ip.get_source().into(),
+                ip.get_destination().into(),
+                ip.payload().to_vec(),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -173,14 +231,11 @@ fn process_stream(stream: &mut StreamBuffer) {
                 let mut h_str = String::new();
                 for h in req.headers.iter() {
                     let name = h.name.to_lowercase();
+                    let val = String::from_utf8_lossy(h.value);
                     if name == "content-length" {
-                        content_len = String::from_utf8_lossy(h.value).parse().unwrap_or(0);
+                        content_len = val.parse().unwrap_or(0);
                     }
-                    h_str.push_str(&format!(
-                        "  {}: {}\n",
-                        h.name,
-                        String::from_utf8_lossy(h.value)
-                    ));
+                    h_str.push_str(&format!("  {}: {}\n", h.name, val));
                 }
                 stream.current_tx = Some(HttpTransaction {
                     req_header: format!(
@@ -241,8 +296,6 @@ fn process_stream(stream: &mut StreamBuffer) {
                         tx.expected_res_len = clen;
                         tx.state = TransactionState::ResponseBody;
                         consumed = amt;
-
-                        // 如果响应没有 Body (CL=0) 且非 SSE，立即输出
                         if !tx.is_sse && tx.expected_res_len == 0 {
                             output_transaction(tx);
                             stream.current_tx = None;
@@ -253,7 +306,6 @@ fn process_stream(stream: &mut StreamBuffer) {
                     if tx.is_sse {
                         let body = String::from_utf8_lossy(&stream.data).to_string();
                         let mut new_e = false;
-                        // 分隔符解析
                         for e in body.split("\n\n") {
                             if !e.trim().is_empty() {
                                 tx.res_body_events.push(e.trim().to_string());
@@ -265,15 +317,12 @@ fn process_stream(stream: &mut StreamBuffer) {
                             output_transaction(tx);
                         }
                     } else {
-                        // 普通请求 Body 收集
                         let take = std::cmp::min(
                             tx.expected_res_len - tx.res_body_raw.len(),
                             stream.data.len(),
                         );
                         tx.res_body_raw.extend_from_slice(&stream.data[..take]);
                         consumed = take;
-
-                        // 收集完成后输出
                         if tx.res_body_raw.len() >= tx.expected_res_len {
                             output_transaction(tx);
                             stream.current_tx = None;
@@ -292,7 +341,6 @@ fn process_stream(stream: &mut StreamBuffer) {
 
 fn output_transaction(tx: &mut HttpTransaction) {
     if tx.is_sse {
-        // SSE 模式：聚合重绘输出
         println!(
             "\n\x1b[1;35m[SSE 会话更新 - 累计事件: {}]\x1b[0m",
             tx.res_body_events.len()
@@ -313,7 +361,6 @@ fn output_transaction(tx: &mut HttpTransaction) {
         }
         println!("\x1b[1;35m{}\x1b[0m", "-".repeat(50));
     } else if !tx.req_printed {
-        // 普通请求：收集完 Body 后一次性输出
         println!("\n\x1b[1;36m==================== TRANSACTION ====================\x1b[0m");
         println!("{}", tx.req_header);
         if !tx.req_body.is_empty() {
@@ -331,13 +378,11 @@ fn output_transaction(tx: &mut HttpTransaction) {
 }
 
 fn pretty_json(raw: &str, indent: &str) {
-    // 兼容 SSE 的 data: 前缀
     let clean = if raw.starts_with("data: ") {
         raw.strip_prefix("data: ").unwrap_or(raw).trim()
     } else {
         raw.trim()
     };
-
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(clean) {
         if let Ok(p) = serde_json::to_string_pretty(&v) {
             for l in p.lines() {
@@ -346,6 +391,5 @@ fn pretty_json(raw: &str, indent: &str) {
             return;
         }
     }
-    // 非 JSON 则原样输出
     println!("{}{}", indent, raw);
 }
